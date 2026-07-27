@@ -50,7 +50,7 @@ serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 boa_engine = { version = "0.21", optional = true }
 boa_gc = { version = "0.21", optional = true }
 # time 0.3.48 conflicts with boa_engine 0.21.1's blanket From implementation.
-time = { version = "=0.3.47", optional = true, default-features = false }
+time = { version = "0.3.51", optional = true, default-features = false }
 
 [dev-dependencies]
 alloy-hardforks = "0.4"
