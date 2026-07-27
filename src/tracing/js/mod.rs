@@ -332,6 +332,7 @@ impl JsInspector {
             ExecutionResult::Halt { reason, .. } => {
                 error = Some(format!("execution halted: {reason:?}"));
             }
+            ExecutionResult::FrameTransaction { .. } => {}
         };
 
         if let TransactTo::Call(target) = tx.kind() {
