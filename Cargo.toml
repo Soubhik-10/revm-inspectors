@@ -36,7 +36,7 @@ alloy-sol-types = { version = "1.4", default-features = false }
 alloy-primitives = { version = "1.4", default-features = false, features = [
     "map",
 ] }
-revm = { git = "https://github.com/Soubhik-10/revm", rev = "2ae17b5e1bae054c46aa44c12873e3e7e9cd014e", version = "43.0.0", default-features = false }
+revm = { git = "https://github.com/Soubhik-10/revm", rev = "c52ae0689c7684142ec2c4d5748ce9b21a46a3e8", version = "43.0.0", default-features = false }
 
 anstyle = { version = "1.0", optional = true }
 colorchoice = "1.0"
