@@ -81,6 +81,11 @@ impl DebugInspector {
     pub fn new(opts: GethDebugTracingOptions) -> Result<Self, DebugInspectorError> {
         let GethDebugTracingOptions { config, tracer, tracer_config, .. } = opts;
 
+        // Normalize an empty tracer name to None so it selects DebugInspector::Default below,
+        // the opcode logger that produces structLogs, just like an absent tracer name.
+        // See https://github.com/ethereum/execution-apis/blob/main/src/schemas/opcode-tracer.yaml
+        let tracer = tracer.filter(|tracer| !tracer.as_str().is_empty());
+
         let this = if let Some(tracer) = tracer {
             #[allow(unreachable_patterns)]
             match tracer {
@@ -198,9 +203,7 @@ impl DebugInspector {
                 *inspector = MuxInspector::try_from_config(config.clone())?;
             }
             #[cfg(feature = "js-tracer")]
-            Self::Js(inspector) => {
-                *inspector = inspector.try_clone()?.into();
-            }
+            Self::Js(inspector) => inspector.fuse()?,
         }
 
         Ok(())
@@ -251,10 +254,13 @@ impl DebugInspector {
                 gas_refund: res.result.gas().final_refunded(),
             }
             .into(),
-            Self::Mux(inspector, _) => inspector
-                .try_into_mux_frame(res, db, tx_info)
-                .map_err(DebugInspectorError::Database)?
-                .into(),
+            Self::Mux(inspector, _) => {
+                inspector.set_transaction_gas_limit(tx_env.gas_limit());
+                inspector
+                    .try_into_mux_frame(res, db, tx_info)
+                    .map_err(DebugInspectorError::Database)?
+                    .into()
+            }
             Self::FlatCallTracer(inspector) => {
                 inspector.set_transaction_gas_limit(tx_env.gas_limit());
                 inspector.set_transaction_caller(tx_env.caller());
