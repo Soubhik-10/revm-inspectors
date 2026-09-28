@@ -112,6 +112,16 @@ pub struct CallTrace {
     pub gas_refund_counter: u64,
     /// The final status of the call.
     pub status: Option<InstructionResult>,
+    /// An error which is not represented by an EVM instruction result.
+    ///
+    /// This is used for protocol-level call frames that never enter the EVM.
+    pub error: Option<String>,
+    /// Whether this call is the synthetic root of an EIP-8141 frame transaction.
+    pub frame_transaction_root: bool,
+    /// The index of this top-level EIP-8141 frame, if applicable.
+    pub frame_index: Option<usize>,
+    /// Whether this call entered the EVM interpreter.
+    pub entered_evm: bool,
     /// Opcode-level execution steps.
     pub steps: Vec<CallTraceStep>,
     /// The deltas recorded for [`Self::steps`], in step order.
@@ -130,6 +140,9 @@ impl CallTrace {
     /// Returns true if the status code is an error or revert, See [InstructionResult::Revert]
     #[inline]
     pub const fn is_error(&self) -> bool {
+        if self.error.is_some() {
+            return true;
+        }
         let Some(status) = self.status else {
             return false;
         };
@@ -160,7 +173,9 @@ impl CallTrace {
 
     /// Returns the error message if it is an erroneous result.
     pub(crate) fn as_error_msg(&self, kind: TraceStyle) -> Option<String> {
-        self.status.and_then(|status| utils::fmt_error_msg(status, kind))
+        self.error
+            .clone()
+            .or_else(|| self.status.and_then(|status| utils::fmt_error_msg(status, kind)))
     }
 
     /// Gets the decoded call trace.
@@ -452,7 +467,7 @@ impl CallTraceNode {
 
             // A revert, including the depth and balance prechecks, and a failed nonce precheck
             // return their unused gas.
-            if !self.status().is_some_and(|status| {
+            if self.trace.error.is_none() && !self.status().is_some_and(|status| {
                 status.is_revert() || status == InstructionResult::NonceOverflow
             }) {
                 call_frame.gas_used = U256::from(self.trace.gas_limit);

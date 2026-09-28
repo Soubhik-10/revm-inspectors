@@ -10,7 +10,6 @@ use alloy_primitives::{
 };
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::parity::*;
-use core::iter::Peekable;
 use revm::{
     context_interface::result::{ExecutionResult, HaltReasonTr, ResultAndState},
     interpreter::InstructionResult,
@@ -221,8 +220,11 @@ impl ParityTraceBuilder {
     fn transaction_traces(&self) -> Vec<TransactionTrace> {
         let mut traces = Vec::with_capacity(self.nodes.len());
         let mut trace_addresses = self.trace_addresses();
-        // Boolean marker to track if sorting for selfdestruct is needed
-        let mut sorting_selfdestruct = false;
+        // EIP-8141 may add skipped atomic frames after later frames have already executed, so its
+        // arena order need not be its consensus frame order. Selfdestruct traces also require a
+        // trace-address sort.
+        let mut sorting_selfdestruct =
+            self.nodes.first().is_some_and(|node| node.trace.frame_transaction_root);
 
         for node in self.iter_traceable_nodes() {
             let trace_address = core::mem::take(&mut trace_addresses[node.idx]);
@@ -258,17 +260,7 @@ impl ParityTraceBuilder {
 
     /// Returns an iterator over all recorded traces  for `trace_transaction`
     pub fn into_transaction_traces_iter(self) -> impl Iterator<Item = TransactionTrace> {
-        let trace_addresses = self.trace_addresses();
-        TransactionTraceIter {
-            next_selfdestructs: Default::default(),
-            iter: self
-                .nodes
-                .into_iter()
-                .zip(trace_addresses)
-                .filter(|(node, _)| !node.is_precompile())
-                .map(|(node, trace_address)| (node.parity_transaction_trace(trace_address), node))
-                .peekable(),
-        }
+        self.transaction_traces().into_iter()
     }
 
     /// Returns the raw traces of the transaction
@@ -280,13 +272,48 @@ impl ParityTraceBuilder {
     ///
     /// Bytecode is included if it was recorded by the inspector.
     pub fn vm_trace(&self) -> VmTrace {
-        self.nodes.first().map(|node| self.make_vm_trace(node)).unwrap_or_default()
+        self.nodes
+            .first()
+            .map(|node| {
+                if node.trace.frame_transaction_root {
+                    self.make_frame_transaction_vm_trace(node)
+                } else {
+                    self.make_vm_trace(node)
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Creates the synthetic VM root specified for an EIP-8141 frame transaction.
+    fn make_frame_transaction_vm_trace(&self, root: &CallTraceNode) -> VmTrace {
+        let ops = root
+            .children
+            .iter()
+            .filter_map(|child| {
+                let trace = &self.nodes[*child].trace;
+                trace.entered_evm.then(|| VmInstruction {
+                    pc: trace.frame_index.expect("frame trace nodes carry their frame index"),
+                    cost: trace.gas_limit,
+                    ex: Some(VmExecutedOperation {
+                        used: trace.gas_limit.saturating_sub(trace.gas_used),
+                        push: Default::default(),
+                        mem: None,
+                        store: None,
+                    }),
+                    sub: Some(self.make_vm_trace(&self.nodes[*child])),
+                    op: None,
+                    idx: None,
+                })
+            })
+            .collect();
+        VmTrace { code: Default::default(), ops }
     }
 
     /// Returns a VM trace with the recorded bytecode.
     ///
     /// Iteratively creates a VM trace by traversing the recorded nodes in the arena
     fn make_vm_trace(&self, start: &CallTraceNode) -> VmTrace {
+        let start_idx = start.idx;
         let mut child_idx_stack = Vec::with_capacity(self.nodes.len());
         let mut sub_stack = Vec::with_capacity(self.nodes.len());
 
@@ -350,7 +377,7 @@ impl ParityTraceBuilder {
                     }
 
                     match current.parent {
-                        Some(parent) => {
+                        Some(parent) if current.idx != start_idx => {
                             // A call or creation that failed its precheck entered no frame.
                             sub_stack.push(entered_frame(current).then(|| VmTrace {
                                 code: current.trace.bytecode.clone().unwrap_or_default(),
@@ -361,7 +388,7 @@ impl ParityTraceBuilder {
 
                             current = self.nodes.get(parent).expect("there should be a parent");
                         }
-                        None => break instructions,
+                        _ => break instructions,
                     }
                 }
             }
