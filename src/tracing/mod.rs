@@ -326,6 +326,11 @@ impl TracingInspector {
             });
         }
 
+        // The RPC receipt status of a frame transaction is successful only when every frame
+        // succeeds. Keep the synthetic root aligned with that derived transaction status.
+        let root_success =
+            frame_receipts.iter().all(|receipt| receipt.status == FrameStatus::Success);
+
         for (index, (frame, receipt)) in frames.iter().zip(frame_receipts).enumerate() {
             let node = match frame_nodes[index] {
                 Some(node) => node,
@@ -392,9 +397,9 @@ impl TracingInspector {
         root_node.ordering = (0..root_node.children.len()).map(TraceMemberOrder::Call).collect();
         root_node.trace.gas_used = result.tx_gas_used();
         root_node.trace.output = Bytes::new();
-        root_node.trace.success = true;
-        root_node.trace.status = Some(revm::interpreter::InstructionResult::Stop);
-        root_node.trace.error = None;
+        root_node.trace.success = root_success;
+        root_node.trace.status = root_success.then_some(revm::interpreter::InstructionResult::Stop);
+        root_node.trace.error = (!root_success).then(|| "frame transaction failed".into());
 
         let mut log_index = 0;
         for child in root_node.children.clone() {
@@ -1216,6 +1221,9 @@ mod tests {
         inspector.finalize_frame_transaction(&result).unwrap();
         let root = &inspector.traces.arena[0];
         assert_eq!(root.trace.gas_used, 100);
+        assert!(!root.trace.success);
+        assert_eq!(root.trace.error.as_deref(), Some("frame transaction failed"));
+        assert!(root.trace.status.is_none());
         assert_eq!(root.children.len(), 4);
         assert_eq!(
             root.children
@@ -1232,12 +1240,16 @@ mod tests {
 
         let traces = inspector.clone().into_parity_builder().into_transaction_traces();
         assert_eq!(traces.len(), 5);
+        assert_eq!(traces[0].error.as_deref(), Some("frame transaction failed"));
+        assert!(traces[0].result.is_some());
         assert_eq!(traces[3].trace_address, vec![2]);
         assert_eq!(traces[3].error.as_deref(), Some("frame skipped"));
         assert!(traces[3].result.is_none());
 
         let calls =
             inspector.clone().into_geth_builder().geth_call_traces(CallConfig::default(), 100);
+        assert_eq!(calls.error.as_deref(), Some("frame transaction failed"));
+        assert_eq!(calls.gas_used, U256::from(100));
         assert_eq!(calls.calls.len(), 4);
         assert_eq!(calls.calls[2].error.as_deref(), Some("frame skipped"));
         assert_eq!(calls.calls[2].gas, U256::from(20));

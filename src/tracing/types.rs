@@ -323,7 +323,10 @@ impl CallTraceNode {
     /// Converts this node into a parity `TransactionTrace`
     pub fn parity_transaction_trace(&self, trace_address: Vec<usize>) -> TransactionTrace {
         let action = self.parity_action();
-        let result = if self.trace.is_error() && !self.trace.is_revert() {
+        let result = if self.trace.is_error()
+            && !self.trace.is_revert()
+            && !self.trace.frame_transaction_root
+        {
             // if the trace is a selfdestruct or an error that is not a revert, the result is None
             None
         } else {
