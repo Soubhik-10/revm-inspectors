@@ -10,13 +10,16 @@ use crate::{
     },
 };
 use alloc::{boxed::Box, vec::Vec};
+use alloy_eip8141::{Frame, FrameMode, FrameStatus, ENTRY_POINT};
 use core::{borrow::Borrow, mem};
 use revm::{
     bytecode::opcode::{self, OpCode},
     context::{JournalTr, LocalContextTr},
-    context_interface::{Cfg, ContextTr},
+    context_interface::{result::ExecutionResult, transaction::Transaction, Cfg, ContextTr},
+    handler::FrameResult,
     inspector::JournalExt,
     interpreter::{
+        interpreter_action::FrameInput,
         interpreter_types::{Immediates, Jumps, LoopControl, ReturnData, RuntimeFlag},
         CallInput, CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Interpreter,
         InterpreterResult,
@@ -94,6 +97,49 @@ pub struct TracingInspector {
     ///
     /// All `Vec<CallTraceStep>` are always empty but may have capacity.
     reusable_step_vecs: Vec<Vec<CallTraceStep>>,
+    /// EIP-8141 frame-transaction bookkeeping retained until receipt finalization.
+    frame_transaction: Option<FrameTransactionTrace>,
+}
+
+/// EIP-8141 data which is unavailable to ordinary EVM call hooks.
+///
+/// In particular, skipped atomic-batch frames and final state-gas/log accounting are only known
+/// after the frame transaction has completed.
+#[derive(Clone, Debug)]
+struct FrameTransactionTrace {
+    /// Synthetic root trace node.
+    root: usize,
+    /// Transaction sender, used to resolve empty frame targets.
+    sender: Address,
+    /// Original ordered frame definitions.
+    frames: Vec<Frame>,
+    /// Arena node for every frame which entered the frame executor.
+    frame_nodes: Vec<Option<usize>>,
+    /// Top-level frame whose call hook is about to run.
+    pending_frame: Option<usize>,
+}
+
+/// An error returned while finalizing an EIP-8141 frame-transaction trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FrameTransactionTraceError {
+    /// The supplied execution result is not for a frame transaction.
+    #[error("execution result is not an EIP-8141 frame transaction")]
+    NotFrameTransaction,
+    /// The inspector did not observe any executable frame in the transaction.
+    #[error("tracing inspector did not observe the EIP-8141 frame transaction")]
+    NotObserved,
+    /// The execution result does not contain one receipt and output per frame.
+    #[error(
+        "EIP-8141 result length mismatch: {frames} frames, {receipts} receipts, {outputs} outputs"
+    )]
+    ResultLengthMismatch {
+        /// Number of frames in the transaction.
+        frames: usize,
+        /// Number of frame receipts in the execution result.
+        receipts: usize,
+        /// Number of frame outputs in the execution result.
+        outputs: usize,
+    },
 }
 
 impl TracingInspector {
@@ -119,6 +165,7 @@ impl TracingInspector {
             // kept
             config,
             reusable_step_vecs,
+            frame_transaction,
         } = self;
 
         // if we record steps we can reuse the individual calltracestep vecs
@@ -139,6 +186,7 @@ impl TracingInspector {
         *last_journal_len = 0;
         *record_step_end = false;
         *recorded_steps = 0;
+        frame_transaction.take();
     }
 
     /// Resets the inspector to it's initial state of [Self::new].
@@ -245,6 +293,129 @@ impl TracingInspector {
         }
     }
 
+    /// Finalizes an EIP-8141 frame trace from the canonical execution result.
+    ///
+    /// EIP-8141 executes each top-level frame separately. The execution result is therefore the
+    /// source of truth for each frame's final gas, output, and receipt status, including frames
+    /// skipped after an atomic batch failure. Call this once, after `transact` returns its
+    /// [`ExecutionResult::FrameTransaction`].
+    ///
+    /// Frames that fail before an inspector hook runs are reconstructed from their transaction
+    /// data and receipt so that every transaction frame is represented in the trace.
+    pub fn finalize_frame_transaction<HaltReasonTy>(
+        &mut self,
+        result: &ExecutionResult<HaltReasonTy>,
+    ) -> Result<(), FrameTransactionTraceError> {
+        let ExecutionResult::FrameTransaction { frame_receipts, frame_outputs, .. } = result else {
+            return Err(FrameTransactionTraceError::NotFrameTransaction);
+        };
+        let Some(frame_transaction) = self.frame_transaction.as_ref() else {
+            return Err(FrameTransactionTraceError::NotObserved);
+        };
+
+        let root = frame_transaction.root;
+        let sender = frame_transaction.sender;
+        let frames = frame_transaction.frames.clone();
+        let mut frame_nodes = frame_transaction.frame_nodes.clone();
+
+        if frame_receipts.len() != frames.len() || frame_outputs.len() != frames.len() {
+            return Err(FrameTransactionTraceError::ResultLengthMismatch {
+                frames: frames.len(),
+                receipts: frame_receipts.len(),
+                outputs: frame_outputs.len(),
+            });
+        }
+
+        // The RPC receipt status of a frame transaction is successful only when every frame
+        // succeeds. Keep the synthetic root aligned with that derived transaction status.
+        let root_success =
+            frame_receipts.iter().all(|receipt| receipt.status == FrameStatus::Success);
+
+        for (index, (frame, receipt)) in frames.iter().zip(frame_receipts).enumerate() {
+            let node = match frame_nodes[index] {
+                Some(node) => node,
+                None => {
+                    let node = self.push_unexecuted_frame_trace(
+                        root,
+                        sender,
+                        frame,
+                        index,
+                        receipt.status,
+                    );
+                    frame_nodes[index] = Some(node);
+                    node
+                }
+            };
+
+            let trace = &mut self.traces.arena[node].trace;
+            trace.gas_limit = frame.limits.execution.saturating_add(frame.limits.state);
+            trace.gas_used = receipt.gas_used.execution.saturating_add(receipt.gas_used.state);
+            trace.output = frame_outputs[index].clone();
+            trace.frame_index = Some(index);
+
+            match receipt.status {
+                FrameStatus::Success => {
+                    trace.success = true;
+                    trace.error = None;
+                    trace.status = Some(revm::interpreter::InstructionResult::Stop);
+                    if receipt.logs.is_empty() {
+                        self.clear_trace_logs(node);
+                    }
+                }
+                FrameStatus::Failure => {
+                    trace.success = false;
+                    if trace.status.is_none_or(|status| status.is_ok()) {
+                        trace.error = Some("frame failed".into());
+                    }
+                    self.clear_trace_logs(node);
+                }
+                FrameStatus::SkippedAtomicBatch => {
+                    trace.success = false;
+                    trace.status = None;
+                    trace.error = Some("frame skipped".into());
+                    trace.output = Bytes::new();
+                    trace.gas_used = 0;
+                    self.clear_trace_logs(node);
+                }
+            }
+        }
+
+        let children = {
+            let nodes = &self.traces.arena;
+            let mut children = frame_nodes
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .expect("all EIP-8141 frames have a trace node after finalization");
+            children.sort_unstable_by_key(|node| {
+                nodes[*node].trace.frame_index.expect("frame trace nodes carry their frame index")
+            });
+            children
+        };
+        let root_node = &mut self.traces.arena[root];
+        root_node.children = children;
+        root_node.ordering = (0..root_node.children.len()).map(TraceMemberOrder::Call).collect();
+        root_node.trace.gas_used = result.tx_gas_used();
+        root_node.trace.output = Bytes::new();
+        root_node.trace.success = root_success;
+        root_node.trace.status = root_success.then_some(revm::interpreter::InstructionResult::Stop);
+        root_node.trace.error = (!root_success).then(|| "frame transaction failed".into());
+
+        let mut log_index = 0;
+        for child in root_node.children.clone() {
+            self.reindex_trace_logs(child, &mut log_index);
+        }
+
+        if self.trace_stack.last().copied() == Some(root) {
+            self.trace_stack.pop();
+        }
+        if let Some(frame_transaction) = self.frame_transaction.as_mut() {
+            frame_transaction.frame_nodes = frame_nodes;
+            frame_transaction.pending_frame = None;
+        }
+        Ok(())
+    }
+
     /// Consumes the Inspector and returns a [ParityTraceBuilder].
     #[inline]
     pub fn into_parity_builder(self) -> ParityTraceBuilder {
@@ -278,7 +449,7 @@ impl TracingInspector {
     /// Returns true if we're no longer in the context of the root call.
     fn is_deep(&self) -> bool {
         // the root call will always be the first entry in the trace stack
-        !self.trace_stack.is_empty()
+        self.trace_stack.len() > usize::from(self.frame_transaction.is_some())
     }
 
     /// Returns true if this a call to a precompile contract.
@@ -352,7 +523,7 @@ impl TracingInspector {
         caller: Address,
         gas_limit: u64,
         maybe_precompile: Option<bool>,
-    ) {
+    ) -> usize {
         // This will only be true if the inspector is configured to exclude precompiles and the call
         // is to a precompile
         let push_kind = if maybe_precompile.unwrap_or(false) {
@@ -368,7 +539,7 @@ impl TracingInspector {
         // the currently active call is the parent of the new call
         let parent = self.trace_stack.last().copied().unwrap_or_default();
 
-        self.trace_stack.push(self.traces.push_trace(
+        let trace = self.traces.push_trace(
             parent,
             push_kind,
             CallTrace {
@@ -384,7 +555,116 @@ impl TracingInspector {
                 steps,
                 ..Default::default()
             },
-        ));
+        );
+        self.trace_stack.push(trace);
+        trace
+    }
+
+    /// Starts the synthetic EIP-8141 transaction root before the first top-level frame call.
+    fn start_frame_transaction_trace<CTX: ContextTr>(&mut self, context: &CTX) {
+        let transaction = context
+            .tx()
+            .frame_transaction()
+            .expect("frame transaction runtime implies a frame transaction");
+        let root = self.traces.push_trace(
+            0,
+            PushTraceKind::PushAndAttachToParent,
+            CallTrace {
+                depth: 0,
+                success: true,
+                caller: context.tx().caller(),
+                address: ENTRY_POINT,
+                kind: CallKind::Call,
+                gas_limit: context.tx().gas_limit(),
+                frame_transaction_root: true,
+                ..Default::default()
+            },
+        );
+        self.trace_stack.push(root);
+        self.frame_transaction = Some(FrameTransactionTrace {
+            root,
+            sender: context.tx().caller(),
+            frames: transaction.frames.clone(),
+            frame_nodes: vec![None; transaction.frames.len()],
+            pending_frame: None,
+        });
+    }
+
+    /// Returns whether a frame hook is beginning a top-level EIP-8141 frame.
+    fn is_top_level_frame<CTX: ContextTr>(&self, context: &CTX) -> bool {
+        // The frame orchestrator opens a rollback checkpoint before invoking the inspector. A
+        // top-level frame therefore starts at depth one; nested EVM calls start at greater depths.
+        context.local().frame_transaction().is_some() && context.journal().depth() == 1
+    }
+
+    /// Adds an EIP-8141 frame which did not reach an inspector call hook.
+    fn push_unexecuted_frame_trace(
+        &mut self,
+        root: usize,
+        sender: Address,
+        frame: &Frame,
+        frame_index: usize,
+        status: FrameStatus,
+    ) -> usize {
+        let error = match status {
+            FrameStatus::Failure => "frame failed",
+            FrameStatus::SkippedAtomicBatch => "frame skipped",
+            FrameStatus::Success => "frame trace unavailable",
+        };
+        self.traces.push_trace(
+            root,
+            PushTraceKind::PushAndAttachToParent,
+            CallTrace {
+                depth: 1,
+                success: false,
+                caller: if frame.mode == FrameMode::Sender { sender } else { ENTRY_POINT },
+                address: frame.resolved_target(sender),
+                kind: if frame.mode == FrameMode::Verify {
+                    CallKind::StaticCall
+                } else {
+                    CallKind::Call
+                },
+                value: frame.value,
+                data: frame.data.clone(),
+                gas_limit: frame.limits.execution.saturating_add(frame.limits.state),
+                error: Some(error.into()),
+                frame_index: Some(frame_index),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Removes logs from a trace and all of its descendants after a frame-level rollback.
+    fn clear_trace_logs(&mut self, trace: usize) {
+        let mut pending = vec![trace];
+        while let Some(trace) = pending.pop() {
+            let node = &mut self.traces.arena[trace];
+            pending.extend_from_slice(&node.children);
+            node.logs.clear();
+            node.ordering.retain(|member| !matches!(member, TraceMemberOrder::Log(_)));
+        }
+    }
+
+    /// Renumbers visible logs after frame-level rollbacks have removed earlier logs.
+    fn reindex_trace_logs(&mut self, trace: usize, log_index: &mut u64) {
+        let mut pending = vec![(trace, 0)];
+        while let Some((trace, position)) = pending.pop() {
+            let Some(member) = self.traces.arena[trace].ordering.get(position).copied() else {
+                continue;
+            };
+            pending.push((trace, position + 1));
+            match member {
+                TraceMemberOrder::Log(index) => {
+                    self.traces.arena[trace].logs[index].index = *log_index;
+                    *log_index += 1;
+                }
+                TraceMemberOrder::Call(index) => {
+                    let child = self.traces.arena[trace].children[index];
+                    pending.push((child, 0));
+                }
+                TraceMemberOrder::Step(_) => {}
+            }
+        }
     }
 
     /// Fills the current trace with the outcome of a call.
@@ -626,6 +906,9 @@ where
         if self.spec_id.is_none() {
             self.spec_id = Some(interp.runtime_flag.spec_id());
         }
+        if let Some(trace) = self.trace_stack.last().copied() {
+            self.traces.arena[trace].trace.entered_evm = true;
+        }
     }
 
     #[inline]
@@ -688,7 +971,7 @@ where
             .then(|| self.is_precompile_call(context, &to, &value));
 
         let input = inputs.input_data(context);
-        self.start_trace_on_call(
+        let trace = self.start_trace_on_call(
             context,
             to,
             input,
@@ -698,6 +981,12 @@ where
             inputs.gas_limit,
             maybe_precompile,
         );
+        if let Some(frame_transaction) = self.frame_transaction.as_mut() {
+            if let Some(frame) = frame_transaction.pending_frame.take() {
+                frame_transaction.frame_nodes[frame] = Some(trace);
+                self.traces.arena[trace].trace.frame_index = Some(frame);
+            }
+        }
 
         None
     }
@@ -739,6 +1028,29 @@ where
         node.trace.selfdestruct_address = Some(contract);
         node.trace.selfdestruct_refund_target = Some(target);
         node.trace.selfdestruct_transferred_value = Some(value);
+    }
+
+    fn frame_start(
+        &mut self,
+        context: &mut CTX,
+        _frame_input: &mut FrameInput,
+    ) -> Option<FrameResult> {
+        if !self.is_top_level_frame(context) {
+            return None;
+        }
+        if self.frame_transaction.is_none() {
+            self.start_frame_transaction_trace(context);
+        }
+        let frame_index = context
+            .local()
+            .frame_transaction()
+            .expect("top-level frame has frame runtime")
+            .current_frame_index;
+        self.frame_transaction
+            .as_mut()
+            .expect("frame transaction trace was initialized")
+            .pending_frame = Some(frame_index);
+        None
     }
 }
 
@@ -805,5 +1117,149 @@ impl CallInputExt for CallInputs {
                 .unwrap_or_default(),
             CallInput::Bytes(bytes) => bytes.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eip8141::{FrameGasUsed, FrameLimits, FrameReceipt};
+    use alloy_rpc_types_trace::geth::CallConfig;
+    use revm::context_interface::result::ResultGas;
+
+    fn frame(target: Address) -> Frame {
+        Frame {
+            target: target.into(),
+            limits: FrameLimits { execution: 10, state: 10 },
+            ..Default::default()
+        }
+    }
+
+    fn receipt(status: FrameStatus, execution: u64, state: u64) -> FrameReceipt<Log> {
+        FrameReceipt { status, gas_used: FrameGasUsed { execution, state }, logs: Vec::new() }
+    }
+
+    fn frame_node(address: Address, frame_index: usize) -> CallTrace {
+        CallTrace {
+            depth: 1,
+            success: true,
+            status: Some(revm::interpreter::InstructionResult::Stop),
+            address,
+            kind: CallKind::Call,
+            gas_limit: 10,
+            frame_index: Some(frame_index),
+            entered_evm: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn finalizes_frame_receipts_and_inserts_skipped_frames_in_order() {
+        let sender = Address::with_last_byte(1);
+        let addresses = [
+            Address::with_last_byte(2),
+            Address::with_last_byte(3),
+            Address::with_last_byte(4),
+            Address::with_last_byte(5),
+        ];
+        let frames = addresses.into_iter().map(frame).collect::<Vec<_>>();
+        let mut inspector = TracingInspector::default();
+        inspector.traces.arena[0].trace = CallTrace {
+            success: true,
+            caller: sender,
+            address: ENTRY_POINT,
+            kind: CallKind::Call,
+            gas_limit: 100,
+            frame_transaction_root: true,
+            ..Default::default()
+        };
+
+        let first = inspector.traces.push_trace(
+            0,
+            PushTraceKind::PushAndAttachToParent,
+            frame_node(addresses[0], 0),
+        );
+        let failed = inspector.traces.push_trace(
+            0,
+            PushTraceKind::PushAndAttachToParent,
+            CallTrace {
+                status: Some(revm::interpreter::InstructionResult::Revert),
+                ..frame_node(addresses[1], 1)
+            },
+        );
+        let last = inspector.traces.push_trace(
+            0,
+            PushTraceKind::PushAndAttachToParent,
+            frame_node(addresses[3], 3),
+        );
+        inspector.frame_transaction = Some(FrameTransactionTrace {
+            root: 0,
+            sender,
+            frames,
+            frame_nodes: vec![Some(first), Some(failed), None, Some(last)],
+            pending_frame: None,
+        });
+
+        let result = ExecutionResult::<()>::FrameTransaction {
+            gas: ResultGas::default().with_total_gas_spent(100),
+            payer: sender,
+            logs: Vec::new(),
+            frame_receipts: vec![
+                receipt(FrameStatus::Success, 4, 2),
+                receipt(FrameStatus::Failure, 5, 3),
+                receipt(FrameStatus::SkippedAtomicBatch, 0, 0),
+                receipt(FrameStatus::Success, 6, 4),
+            ],
+            frame_outputs: vec![
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
+                Bytes::new(),
+                Bytes::from_static(&[4]),
+            ],
+        };
+
+        inspector.finalize_frame_transaction(&result).unwrap();
+        let root = &inspector.traces.arena[0];
+        assert_eq!(root.trace.gas_used, 100);
+        assert!(!root.trace.success);
+        assert_eq!(root.trace.error.as_deref(), Some("frame transaction failed"));
+        assert!(root.trace.status.is_none());
+        assert_eq!(root.children.len(), 4);
+        assert_eq!(
+            root.children
+                .iter()
+                .map(|node| inspector.traces.arena[*node].trace.frame_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2), Some(3)]
+        );
+
+        let skipped = &inspector.traces.arena[root.children[2]].trace;
+        assert_eq!(skipped.error.as_deref(), Some("frame skipped"));
+        assert_eq!(skipped.gas_used, 0);
+        assert!(skipped.output.is_empty());
+
+        let traces = inspector.clone().into_parity_builder().into_transaction_traces();
+        assert_eq!(traces.len(), 5);
+        assert_eq!(traces[0].error.as_deref(), Some("frame transaction failed"));
+        assert!(traces[0].result.is_some());
+        assert_eq!(traces[3].trace_address, vec![2]);
+        assert_eq!(traces[3].error.as_deref(), Some("frame skipped"));
+        assert!(traces[3].result.is_none());
+
+        let calls =
+            inspector.clone().into_geth_builder().geth_call_traces(CallConfig::default(), 100);
+        assert_eq!(calls.error.as_deref(), Some("frame transaction failed"));
+        assert_eq!(calls.gas_used, U256::from(100));
+        assert_eq!(calls.calls.len(), 4);
+        assert_eq!(calls.calls[2].error.as_deref(), Some("frame skipped"));
+        assert_eq!(calls.calls[2].gas, U256::from(20));
+        assert_eq!(calls.calls[2].gas_used, U256::ZERO);
+
+        let vm_trace = inspector.into_parity_builder().vm_trace();
+        assert_eq!(vm_trace.ops.len(), 3);
+        assert_eq!(vm_trace.ops[0].pc, 0);
+        assert_eq!(vm_trace.ops[1].pc, 1);
+        assert_eq!(vm_trace.ops[2].pc, 3);
+        assert_eq!(vm_trace.ops[0].ex.as_ref().unwrap().used, 14);
     }
 }

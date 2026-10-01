@@ -33,6 +33,7 @@ clippy.lint_groups_priority = "allow"
 alloy-eip2930 = { version = "0.2.4", default-features = false }
 alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "7ed87e72a06060a5b43ba6d5dd700b73c29b537a", version = "2.4.1", default-features = false }
 alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "7ed87e72a06060a5b43ba6d5dd700b73c29b537a", version = "2.4.1", default-features = false }
+alloy-eip8141 = { git = "https://github.com/Soubhik-10/eips", rev = "d7ef6c6682906060453a234de1917cf56bcdafd2", default-features = false }
 alloy-sol-types = { version = "1.4", default-features = false }
 alloy-primitives = { version = "1.4", default-features = false, features = [
     "map",
