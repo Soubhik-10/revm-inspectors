@@ -83,6 +83,26 @@ impl<'a> GethTraceBuilder<'a> {
         storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
         struct_logs: &mut Vec<StructLog>,
     ) {
+        let depth_offset = if main_trace_node.trace.frame_transaction_root {
+            for child in &main_trace_node.children {
+                self.fill_geth_trace_at_depth(&self.nodes[*child], opts, storage, struct_logs, 0);
+            }
+            return;
+        } else {
+            1
+        };
+        self.fill_geth_trace_at_depth(main_trace_node, opts, storage, struct_logs, depth_offset);
+    }
+
+    /// Fills a trace with a fixed depth offset for synthetic transaction roots.
+    fn fill_geth_trace_at_depth(
+        &self,
+        main_trace_node: &CallTraceNode,
+        opts: &GethDefaultTracingOptions,
+        storage: &mut HashMap<Address, BTreeMap<B256, B256>>,
+        struct_logs: &mut Vec<StructLog>,
+        depth_offset: u64,
+    ) {
         // Suspend only the parent iterator when entering a child. Scratch space scales with
         // call depth rather than step count, and a trace without subcalls needs no allocation.
         let mut steps = main_trace_node.steps_with_children();
@@ -102,7 +122,8 @@ impl<'a> GethTraceBuilder<'a> {
             // We increment the depth by one because steps that are part of call at depth N should
             // have depth N + 1. For example, steps inside of a top-level call should
             // have depth 1.
-            let mut log = step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + 1);
+            let mut log =
+                step.convert_to_geth_struct_log(opts, trace_node.trace.depth as u64 + depth_offset);
 
             // Only touch the storage cache when updating it or emitting a storage snapshot.
             if opts.is_storage_enabled()
@@ -242,6 +263,23 @@ impl<'a> GethTraceBuilder<'a> {
         }
 
         if opts.only_top_call.unwrap_or_default() {
+            if main_trace_node.trace.frame_transaction_root {
+                for child in &main_trace_node.children {
+                    let node = &self.nodes[*child];
+                    root_call_frame
+                        .calls
+                        .push(node.geth_empty_call_frame(include_logs && !node.trace.is_error()));
+                }
+            }
+            return root_call_frame;
+        }
+
+        if main_trace_node.trace.frame_transaction_root {
+            for child in &main_trace_node.children {
+                root_call_frame
+                    .calls
+                    .push(self.geth_frame_transaction_call_frame(*child, include_logs));
+            }
             return root_call_frame;
         }
 
@@ -290,6 +328,54 @@ impl<'a> GethTraceBuilder<'a> {
             } else {
                 debug_assert!(call_frames.is_empty(), "only one root node has no parent");
                 return call;
+            }
+        }
+    }
+
+    /// Recursively assembles a call frame under an EIP-8141 synthetic root.
+    ///
+    /// Atomic skips are appended to the trace arena after execution, so arena order does not
+    /// necessarily match frame order. This uses the explicit child order instead.
+    fn geth_frame_transaction_call_frame(&self, index: usize, include_logs: bool) -> CallFrame {
+        struct PendingFrame {
+            index: usize,
+            next_child: usize,
+            logs_visible: bool,
+            frame: CallFrame,
+        }
+
+        let node = &self.nodes[index];
+        let logs_visible = include_logs && !node.trace.is_error();
+        let mut pending = vec![PendingFrame {
+            index,
+            next_child: 0,
+            logs_visible,
+            frame: node.geth_empty_call_frame(logs_visible),
+        }];
+
+        loop {
+            let current = pending.last_mut().expect("frame assembly stack is not empty");
+            if let Some(&child) = self.nodes[current.index].children.get(current.next_child) {
+                current.next_child += 1;
+                let node = &self.nodes[child];
+                let logs_visible = current.logs_visible && !node.trace.is_error();
+                pending.push(PendingFrame {
+                    index: child,
+                    next_child: 0,
+                    logs_visible,
+                    frame: node.geth_empty_call_frame(logs_visible),
+                });
+                continue;
+            }
+
+            let mut completed = pending.pop().expect("frame assembly stack is not empty");
+            if let Some(selfdestruct) = self.nodes[completed.index].geth_selfdestruct_call_trace() {
+                completed.frame.calls.push(selfdestruct);
+            }
+            if let Some(parent) = pending.last_mut() {
+                parent.frame.calls.push(completed.frame);
+            } else {
+                return completed.frame;
             }
         }
     }
