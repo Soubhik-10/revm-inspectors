@@ -470,9 +470,11 @@ impl CallTraceNode {
 
             // A revert, including the depth and balance prechecks, and a failed nonce precheck
             // return their unused gas.
-            if self.trace.error.is_none() && !self.status().is_some_and(|status| {
-                status.is_revert() || status == InstructionResult::NonceOverflow
-            }) {
+            if self.trace.error.is_none()
+                && !self.status().is_some_and(|status| {
+                    status.is_revert() || status == InstructionResult::NonceOverflow
+                })
+            {
                 call_frame.gas_used = U256::from(self.trace.gas_limit);
                 call_frame.output = None;
             }

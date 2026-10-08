@@ -10,6 +10,7 @@ use alloy_primitives::{
 };
 use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::parity::*;
+use core::iter::Peekable;
 use revm::{
     context_interface::result::{ExecutionResult, HaltReasonTr, ResultAndState},
     interpreter::InstructionResult,
@@ -260,7 +261,26 @@ impl ParityTraceBuilder {
 
     /// Returns an iterator over all recorded traces  for `trace_transaction`
     pub fn into_transaction_traces_iter(self) -> impl Iterator<Item = TransactionTrace> {
-        self.transaction_traces().into_iter()
+        let mut self_ = self;
+        let frame_traces =
+            if self_.nodes.first().is_some_and(|node| node.trace.frame_transaction_root) {
+                let traces = self_.transaction_traces();
+                self_.nodes.clear();
+                Some(traces)
+            } else {
+                None
+            };
+        let trace_addresses = self_.trace_addresses();
+        frame_traces.into_iter().flatten().chain(TransactionTraceIter {
+            next_selfdestructs: Default::default(),
+            iter: self_
+                .nodes
+                .into_iter()
+                .zip(trace_addresses)
+                .filter(|(node, _)| !node.is_precompile())
+                .map(|(node, trace_address)| (node.parity_transaction_trace(trace_address), node))
+                .peekable(),
+        })
     }
 
     /// Returns the raw traces of the transaction

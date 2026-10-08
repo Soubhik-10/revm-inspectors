@@ -10,8 +10,8 @@ use crate::{
     },
 };
 use alloc::{boxed::Box, vec::Vec};
-use alloy_rpc_types_trace::parity::StorageDelta;
 use alloy_eip8141::{Frame, FrameMode, FrameStatus, ENTRY_POINT};
+use alloy_rpc_types_trace::parity::StorageDelta;
 use core::{borrow::Borrow, mem, ops::Range};
 use revm::{
     bytecode::opcode::{self, OpCode},
