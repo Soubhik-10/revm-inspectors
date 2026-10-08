@@ -31,14 +31,14 @@ clippy.lint_groups_priority = "allow"
 [dependencies]
 # eth
 alloy-eip2930 = { version = "0.2.4", default-features = false }
-alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "7f8984c56402a2b5da5340d33a5fcefcef2bc578", version = "2.4.1", default-features = false }
-alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "7f8984c56402a2b5da5340d33a5fcefcef2bc578", version = "2.4.1", default-features = false }
+alloy-rpc-types-eth = { git = "https://github.com/Rimeeeeee/alloy", rev = "4f840608305d88164248ac2a7e0caf05c2e0ea0c", version = "2.4.1", default-features = false }
+alloy-rpc-types-trace = { git = "https://github.com/Rimeeeeee/alloy", rev = "4f840608305d88164248ac2a7e0caf05c2e0ea0c", version = "2.4.1", default-features = false }
 alloy-eip8141 = { git = "https://github.com/Rimeeeeee/eips", rev = "ebce0fdf2b511d4f7e3a5f8c2004b67d6be35254", default-features = false }
 alloy-sol-types = { version = "1.4", default-features = false }
 alloy-primitives = { version = "1.4", default-features = false, features = [
     "map",
 ] }
-revm = { git = "https://github.com/Rimeeeeee/revm", rev = "6bc175f3f8032b13a8bb1e7e1219e8f9fe45ffa4", version = "43.0.2", default-features = false }
+revm = { git = "https://github.com/Rimeeeeee/revm", rev = "613fd7fd0c1300d3409e213183ace0f9cfc660f5", version = "43.0.2", default-features = false }
 
 anstyle = { version = "1.0", optional = true }
 colorchoice = "1.0"
