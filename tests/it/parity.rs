@@ -460,3 +460,295 @@ fn test_parity_delegatecall_selfdestruct() {
     assert_eq!(action2.address, delegate_addr);
     assert_eq!(action2.refund_address, deployer);
 }
+
+fn trace_vm_code(code: &[u8], child: &[u8]) -> alloy_rpc_types_trace::parity::VmTrace {
+    let config =
+        TracingInspectorConfig::from_parity_config(&HashSet::from_iter([TraceType::VmTrace]));
+    inspect_code(code, child, SpecId::default(), config).into_parity_builder().vm_trace()
+}
+
+fn inspect_code(
+    code: &[u8],
+    child: &[u8],
+    spec: SpecId,
+    config: TracingInspectorConfig,
+) -> TracingInspector {
+    use revm::bytecode::Bytecode;
+    let target = Address::with_last_byte(0x42);
+    let child_address = Address::with_last_byte(0x43);
+    let mut db = CacheDB::<EmptyDB>::default();
+    for (address, code) in [(target, code), (child_address, child)] {
+        db.insert_account_info(
+            address,
+            AccountInfo::default().with_code(Bytecode::new_raw(code.to_vec().into())),
+        );
+    }
+    let mut evm = Context::mainnet()
+        .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
+        .with_db(db)
+        .build_mainnet_with_inspector(TracingInspector::new(config));
+    evm.inspect_tx(TxEnv {
+        gas_limit: 1_000_000,
+        kind: TransactTo::Call(target),
+        ..Default::default()
+    })
+    .unwrap();
+    evm.into_inspector()
+}
+
+#[test]
+fn vmtrace_memory_is_attached_to_the_writing_instruction() {
+    let trace = trace_vm_code(&hex!("60016000525f00"), &[]);
+    let mem = trace.ops[2].ex.as_ref().unwrap().mem.as_ref().unwrap();
+    assert_eq!(mem.off, 0);
+    assert_eq!(mem.data.as_ref(), U256::from(1).to_be_bytes::<32>());
+    assert!(trace.ops[3].ex.as_ref().unwrap().mem.is_none());
+}
+
+#[test]
+fn vmtrace_reports_remaining_gas_after_execution() {
+    let trace = trace_vm_code(&hex!("600160020100"), &[]);
+    for pair in trace.ops.windows(2) {
+        assert_eq!(
+            pair[0].ex.as_ref().unwrap().used - pair[1].cost,
+            pair[1].ex.as_ref().unwrap().used
+        );
+    }
+}
+
+#[test]
+fn vmtrace_reports_remaining_gas_after_storage_credit() {
+    // Restore a newly written slot to zero, crediting gas spilled from the state gas reservoir.
+    let inspector = inspect_code(
+        &hex!("60015f555f5f5500"),
+        &[],
+        SpecId::AMSTERDAM,
+        TracingInspectorConfig::parity_vm_trace(),
+    );
+    let steps = &inspector.traces().nodes()[0].trace.steps;
+    let gas_after = steps[6].gas_remaining;
+    assert!(gas_after > steps[5].gas_remaining);
+    let trace = inspector.into_parity_builder().vm_trace();
+    assert_eq!(trace.ops[5].ex.as_ref().unwrap().used, gas_after);
+}
+
+#[test]
+fn non_vm_traces_do_not_record_step_deltas() {
+    // Exercise a memory write, a call and a storage gas credit.
+    let code = hex!("602a5f525f5f5f5f5f604361fffff15060015f555f5f5500");
+    for config in [
+        TracingInspectorConfig::default_geth(),
+        TracingInspectorConfig::default_parity(),
+        TracingInspectorConfig::from_geth_call_config(&Default::default()),
+    ] {
+        let inspector = inspect_code(&code, &hex!("00"), SpecId::AMSTERDAM, config);
+        assert!(inspector.traces().nodes().iter().all(|node| node.trace.step_deltas.is_empty()));
+    }
+}
+
+#[test]
+fn vmtrace_records_storage_for_vm_only_requests() {
+    let trace = trace_vm_code(&hex!("602a5f5500"), &[]);
+    let store = trace.ops[2].ex.as_ref().unwrap().store.as_ref().unwrap();
+    assert_eq!(store.key, U256::ZERO);
+    assert_eq!(store.val, U256::from(42));
+}
+
+/// Returns the `(pc, key, val)` of every reported storage write.
+fn vm_stores(trace: &alloy_rpc_types_trace::parity::VmTrace) -> Vec<(usize, U256, U256)> {
+    trace
+        .ops
+        .iter()
+        .filter_map(|op| op.ex.as_ref()?.store.as_ref().map(|store| (op.pc, store.key, store.val)))
+        .collect()
+}
+
+#[test]
+fn vmtrace_reads_do_not_report_store() {
+    // A cold and a warm SLOAD, then TSTORE and TLOAD.
+    let trace = trace_vm_code(&hex!("5f545f54602a5f5d5f5c00"), &[]);
+    assert!(vm_stores(&trace).is_empty(), "{trace:?}");
+}
+
+#[test]
+fn vmtrace_reports_every_completed_sstore() {
+    // Cold SSTORE of the unchanged value, a changing SSTORE, then a warm SSTORE of the same value.
+    let trace = trace_vm_code(&hex!("5f5f55602a5f55602a5f5500"), &[]);
+    let [zero, answer] = [U256::ZERO, U256::from(42)];
+    assert_eq!(vm_stores(&trace), vec![(2, zero, zero), (6, zero, answer), (10, zero, answer)]);
+}
+
+#[test]
+fn vmtrace_reverted_frame_keeps_its_stores() {
+    let trace = trace_vm_code(&hex!("5f5f5f5f5f604361fffff100"), &hex!("602a5f555f5ffd"));
+    let sub = trace.ops[7].sub.as_ref().unwrap();
+    assert_eq!(vm_stores(sub), vec![(3, U256::ZERO, U256::from(42))]);
+
+    // An SSTORE that halts, here in a static context, has no execution record.
+    let trace = trace_vm_code(&hex!("5f5f5f5f604361fffffa00"), &hex!("602a5f5500"));
+    let sub = trace.ops[6].sub.as_ref().unwrap();
+    assert_eq!(sub.ops[2].op.as_deref(), Some("SSTORE"));
+    assert!(sub.ops[2].ex.is_none());
+}
+
+#[test]
+fn vmtrace_faults_have_no_execution_delta() {
+    for code in [&hex!("01")[..], &hex!("f1")[..], &hex!("fe")[..]] {
+        let trace = trace_vm_code(code, &[]);
+        assert!(trace.ops[0].ex.is_none(), "{trace:?}");
+    }
+}
+
+#[test]
+fn vmtrace_revert_keeps_its_execution_record() {
+    let trace = trace_vm_code(&hex!("5f5ffd"), &[]);
+    let revert = &trace.ops[2];
+    assert_eq!(revert.op.as_deref(), Some("REVERT"));
+    let ex = revert.ex.as_ref().unwrap();
+    assert_eq!(ex.used, trace.ops[1].ex.as_ref().unwrap().used - revert.cost);
+    assert!(ex.push.is_empty());
+    assert!(ex.mem.is_none());
+}
+
+#[test]
+fn vmtrace_call_pushes_result_and_copies_return_memory() {
+    let trace = trace_vm_code(&hex!("602060205f5f5f604361fffff15f00"), &hex!("602a5f5260205ff3"));
+    let call = &trace.ops[7];
+    assert_eq!(call.ex.as_ref().unwrap().push.as_slice(), &[U256::from(1)]);
+    let mem = call.ex.as_ref().unwrap().mem.as_ref().unwrap();
+    assert_eq!(mem.off, 32);
+    assert_eq!(mem.data.as_ref(), U256::from(42).to_be_bytes::<32>());
+}
+
+#[test]
+fn vmtrace_calls_only_record_returned_memory() {
+    for code in [
+        &hex!("602060205f5f5f604361fffff100")[..], // CALL
+        &hex!("602060205f5f5f604361fffff200")[..], // CALLCODE
+        &hex!("602060205f5f604361fffff400")[..],   // DELEGATECALL
+        &hex!("602060205f5f604361fffffa00")[..],   // STATICCALL
+        &hex!("600160205f5f5f604361fffff100")[..], // Output buffer shorter than returndata
+    ] {
+        for child in [
+            &hex!("602a5f5360015ff3")[..], // Return one byte
+            &hex!("602a5f5360015ffd")[..], // Revert with one byte
+            &hex!("602a5f5360205ff3")[..], // Return a full word
+        ] {
+            let trace = trace_vm_code(code, child);
+            let call = &trace.ops[trace.ops.len() - 2];
+            let mem = call.ex.as_ref().unwrap().mem.as_ref().unwrap();
+            let expected_len = if code[1] == 1 || child[5] == 1 { 1 } else { 32 };
+            assert_eq!(mem.off, 32);
+            assert_eq!(mem.data.len(), expected_len);
+            assert_eq!(mem.data[0], 42);
+            assert!(mem.data[1..].iter().all(|byte| *byte == 0));
+        }
+    }
+}
+
+#[test]
+fn vmtrace_empty_return_has_no_memory_delta() {
+    for child in [&[][..], &hex!("00")[..], &hex!("5f5ffd")[..], &hex!("fe")[..]] {
+        // A 64-KiB output buffer must not be copied when the child writes nothing.
+        let trace = trace_vm_code(&hex!("620100005f5f5f5f604361fffff100"), child);
+        assert!(trace.ops[7].ex.as_ref().unwrap().mem.is_none());
+    }
+}
+
+#[test]
+fn vmtrace_stop_only_child_preserves_parent_and_creation_result() {
+    let trace = trace_vm_code(&hex!("60015f5ff05f00"), &[]);
+    assert_eq!(trace.ops.len(), 6);
+    let create = &trace.ops[3];
+    assert_eq!(
+        create.ex.as_ref().unwrap().push.as_slice(),
+        &[U256::from_be_slice(Address::with_last_byte(0x42).create(0).as_slice())]
+    );
+    assert!(create.sub.is_some());
+}
+
+#[test]
+fn vmtrace_nested_sibling_calls_keep_their_own_subtraces() {
+    // The first call has no descendants. The second one calls the same leaf.
+    let call = hex!("5f5f5f5f5f604361fffff1");
+    let mut root = call.to_vec();
+    root.extend(hex!("505f5f5f5f5f604461fffff100"));
+    let mut branch = hex!("5f5f5f5f5f604561fffff1").to_vec();
+    branch.push(0x00);
+    let mut db = CacheDB::<EmptyDB>::default();
+    for (last, code) in [
+        (0x42, root),
+        (0x43, hex!("60015000").to_vec()),
+        (0x44, branch),
+        (0x45, hex!("600260035000").to_vec()),
+    ] {
+        db.insert_account_info(
+            Address::with_last_byte(last),
+            AccountInfo::default().with_code(revm::bytecode::Bytecode::new_raw(code.into())),
+        );
+    }
+    let mut evm = Context::mainnet().with_db(db).build_mainnet_with_inspector(
+        TracingInspector::new(TracingInspectorConfig::parity_vm_trace()),
+    );
+    evm.inspect_tx(TxEnv {
+        gas_limit: 1_000_000,
+        kind: TransactTo::Call(Address::with_last_byte(0x42)),
+        ..Default::default()
+    })
+    .unwrap();
+    let trace = evm.into_inspector().into_parity_builder().vm_trace();
+    assert_eq!(trace.ops[7].sub.as_ref().unwrap().ops.len(), 3);
+    assert_eq!(trace.ops[16].sub.as_ref().unwrap().ops.len(), 9);
+    assert_eq!(trace.ops[16].sub.as_ref().unwrap().ops[7].sub.as_ref().unwrap().ops.len(), 4);
+}
+
+#[test]
+fn vmtrace_precompile_does_not_steal_the_next_calls_subtrace() {
+    let trace =
+        trace_vm_code(&hex!("5f5f5f5f5f600461fffff1505f5f5f5f5f604361fffff100"), &hex!("60015000"));
+    assert!(trace.ops[7].sub.is_none());
+    assert_eq!(trace.ops[16].sub.as_ref().unwrap().ops.len(), 3);
+    assert_eq!(trace.ops[7].ex.as_ref().unwrap().push, vec![U256::from(1)]);
+}
+
+#[test]
+fn vmtrace_memory_copy_and_terminal_writes() {
+    for (code, offset, expected) in [
+        (&hex!("63aabbccdd5f526004601c601d5e00")[..], 29, hex!("aabbccdd").to_vec()),
+        (&hex!("60aa600153")[..], 1, vec![0xaa]),
+    ] {
+        let trace = trace_vm_code(code, &[]);
+        let mem = trace
+            .ops
+            .iter()
+            .rev()
+            .find_map(|op| op.ex.as_ref().and_then(|ex| ex.mem.as_ref()))
+            .unwrap();
+        assert_eq!(mem.off, offset);
+        assert_eq!(mem.data.as_ref(), expected);
+    }
+}
+
+#[test]
+fn vmtrace_failed_child_pushes_zero_and_parent_resumes() {
+    for child in [&hex!("5f5ffd")[..], &hex!("fe")[..]] {
+        let trace = trace_vm_code(&hex!("5f5f5f5f5f604361fffff15f00"), child);
+        assert_eq!(trace.ops[7].ex.as_ref().unwrap().push, vec![U256::ZERO]);
+        assert_eq!(
+            trace.ops[7].ex.as_ref().unwrap().used - trace.ops[8].cost,
+            trace.ops[8].ex.as_ref().unwrap().used
+        );
+    }
+}
+
+#[path = "parity/state_diff_7702.rs"]
+mod state_diff_7702;
+
+#[path = "parity/state_diff_selfdestruct.rs"]
+mod state_diff_selfdestruct;
+
+#[path = "parity/state_diff_birth.rs"]
+mod state_diff_birth;
+
+#[path = "parity/vm_bytecode.rs"]
+mod vm_bytecode;

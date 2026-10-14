@@ -3,7 +3,7 @@ use crate::{
     tracing::{
         arena::PushTraceKind,
         types::{
-            CallKind, CallTraceNode, RecordedMemory, StorageChange, StorageChangeReason,
+            CallKind, CallTraceNode, RecordedMemory, StepDelta, StorageChange, StorageChangeReason,
             TraceMemberOrder,
         },
         utils::gas_used,
@@ -11,7 +11,8 @@ use crate::{
 };
 use alloc::{boxed::Box, vec::Vec};
 use alloy_eip8141::{Frame, FrameMode, FrameStatus, ENTRY_POINT};
-use core::{borrow::Borrow, mem};
+use alloy_rpc_types_trace::parity::StorageDelta;
+use core::{borrow::Borrow, mem, ops::Range};
 use revm::{
     bytecode::opcode::{self, OpCode},
     context::{JournalTr, LocalContextTr},
@@ -39,6 +40,10 @@ pub use builder::{
 
 mod config;
 pub use config::{OpcodeFilter, StackSnapshotType, TracingInspectorConfig};
+
+mod limits;
+use limits::TraceBudget;
+pub use limits::{TraceLimitBehavior, TraceLimits};
 
 mod fourbyte;
 pub use fourbyte::FourByteInspector;
@@ -77,6 +82,8 @@ pub use debug::{DebugInspector, DebugInspectorError};
 pub struct TracingInspector {
     /// Configures what and how the inspector records traces.
     config: TracingInspectorConfig,
+    /// Limits and running usage for recorded trace data.
+    budget: TraceBudget,
     /// Records all call traces
     traces: CallTraceArena,
     /// Tracks active calls
@@ -148,6 +155,22 @@ impl TracingInspector {
         Self { config, ..Default::default() }
     }
 
+    /// Configures the recorded-data budget, checked whenever trace data is recorded.
+    pub fn with_limits(mut self, limits: TraceLimits) -> Self {
+        self.budget.limits = limits;
+        self
+    }
+
+    /// Returns the cumulative byte-buffer allocation lengths since the last reset.
+    pub const fn recorded_bytes(&self) -> usize {
+        self.budget.recorded
+    }
+
+    /// Whether a recording was omitted because its byte budget was exhausted.
+    pub const fn limit_exceeded(&self) -> bool {
+        self.budget.exceeded
+    }
+
     /// Resets the inspector to its initial state of [Self::new].
     /// This makes the inspector ready to be used again.
     ///
@@ -162,6 +185,7 @@ impl TracingInspector {
             spec_id,
             record_step_end,
             recorded_steps,
+            budget,
             // kept
             config,
             reusable_step_vecs,
@@ -187,6 +211,8 @@ impl TracingInspector {
         *record_step_end = false;
         *recorded_steps = 0;
         frame_transaction.take();
+        budget.recorded = 0;
+        budget.exceeded = false;
     }
 
     /// Resets the inspector to it's initial state of [Self::new].
@@ -715,6 +741,14 @@ impl TracingInspector {
         // that not a known constant.
         let op = OpCode::new_or_unknown(interp.bytecode.opcode());
 
+        if self.config.record_step_deltas {
+            self.finish_call_step(interp);
+            if self.budget.exceeded() {
+                self.record_step_end = false;
+                return;
+            }
+        }
+
         let record = self.config.should_record_opcode(op)
             && self.config.step_limit.is_none_or(|limit| self.recorded_steps < limit.get());
         self.record_step_end = record;
@@ -729,23 +763,32 @@ impl TracingInspector {
         // Reuse the memory from the previous step if:
         // - there is not opcode filter -- in this case we cannot rely on the order of steps
         // - it exists and has not modified memory
-        let memory = self.config.record_memory_snapshots.then(|| {
-            if self.config.record_opcodes_filter.is_none() {
-                if let Some(prev) = node.trace.steps.last() {
-                    if !prev.op.modifies_memory() {
-                        if let Some(memory) = &prev.memory {
-                            return memory.clone();
+        let memory = self
+            .config
+            .record_memory_snapshots
+            .then(|| {
+                if self.config.record_opcodes_filter.is_none() {
+                    if let Some(prev) = node.trace.steps.last() {
+                        if !prev.op.modifies_memory() {
+                            if let Some(memory) = &prev.memory {
+                                return Some(memory.clone());
+                            }
                         }
                     }
                 }
-            }
-            RecordedMemory::new(&interp.memory.borrow().context_memory())
-        });
+                let memory = interp.memory.borrow();
+                let bytes = memory.context_memory();
+                self.budget.reserve(bytes.len()).then(|| RecordedMemory::new(&bytes))
+            })
+            .flatten();
 
         let stack = if self.config.record_stack_snapshots.is_all()
             || self.config.record_stack_snapshots.is_full()
         {
             Some(interp.stack.data().as_slice().into())
+        } else if self.config.record_stack_snapshots.is_top() {
+            let top = interp.stack.data().last().map(core::slice::from_ref).unwrap_or_default();
+            Some(top.into())
         } else {
             None
         };
@@ -764,7 +807,7 @@ impl TracingInspector {
         let mut immediate_bytes = None;
         if self.config.record_immediate_bytes {
             let size = immediate_size(&interp.bytecode);
-            if size != 0 {
+            if size != 0 && self.budget.reserve(size as usize) {
                 immediate_bytes = Some(Bytes::copy_from_slice(
                     &interp.bytecode.read_slice(size as usize + 1)[1..],
                 ));
@@ -803,6 +846,53 @@ impl TracingInspector {
         });
 
         node.ordering.push(TraceMemberOrder::Step(step_idx));
+
+        if self.config.record_step_deltas {
+            let write_range = memory_write_range(op.get(), interp.stack.data());
+            let store = storage_write(op.get(), interp.stack.data());
+            if write_range.is_some()
+                || store.is_some()
+                || node.trace.steps[step_idx].is_call_like_op()
+            {
+                node.trace.step_deltas.push(StepDelta {
+                    step: step_idx,
+                    store,
+                    write_range,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    /// Completes the delta of the last step if it is a call-like step whose frame returned.
+    ///
+    /// The result of a CALL or CREATE is pushed to the stack, the returned data copied into
+    /// memory and the unused gas returned only after `step_end`, once the parent interpreter
+    /// resumes, so this runs at the start of its next step.
+    fn finish_call_step(&mut self, interp: &Interpreter) {
+        let trace_idx = self.last_trace_idx();
+        let trace = &mut self.traces.arena[trace_idx].trace;
+        let step_idx = trace.steps.len().wrapping_sub(1);
+        let Some((step, delta)) = trace.steps.last_mut().zip(trace.step_deltas.last_mut()) else {
+            return;
+        };
+        if delta.step != step_idx
+            || !step.is_call_like_op()
+            || step.is_error()
+            || delta.gas_remaining_after.is_some()
+        {
+            return;
+        }
+
+        delta.gas_remaining_after = Some(interp.gas.remaining());
+        if step.push_stack.is_some() {
+            step.push_stack = Some(interp.stack.data().last().copied().into_iter().collect());
+        }
+        // CALL only overwrites the returned bytes; the rest of its output buffer is unchanged.
+        if let Some(range) = &mut delta.write_range {
+            range.end = range.start + range.len().min(interp.return_data.buffer().len());
+        }
+        delta.record_memory_write(&interp.memory.borrow().context_memory(), &mut self.budget);
     }
 
     /// Fills the current trace with the output of a step.
@@ -822,7 +912,8 @@ impl TracingInspector {
 
         let trace_idx = self.last_trace_idx();
         let node = &mut self.traces.arena[trace_idx];
-        let step = node.trace.steps.last_mut().unwrap();
+        let step_idx = node.trace.steps.len() - 1;
+        let step = &mut node.trace.steps[step_idx];
 
         // See comments in `start_step`.
         debug_assert!(
@@ -894,7 +985,30 @@ impl TracingInspector {
         }
 
         // set the status
-        step.status = interp.bytecode.action().as_ref().and_then(|i| i.instruction_result())
+        step.status = interp.bytecode.action().as_ref().and_then(|i| i.instruction_result());
+
+        // Call-like steps write memory only once the parent frame resumes, see
+        // `finish_call_step`.
+        if self.config.record_step_deltas && !step.is_error() && !step.is_call_like_op() {
+            // Gas credits, such as EIP-8037 storage restoration, cannot be recovered from the
+            // saturated unsigned gas cost.
+            let gas_remaining_after =
+                (interp.gas.remaining() > step.gas_remaining).then_some(interp.gas.remaining());
+            if gas_remaining_after.is_some()
+                && node.trace.step_deltas.last().is_none_or(|delta| delta.step != step_idx)
+            {
+                node.trace.step_deltas.push(StepDelta { step: step_idx, ..Default::default() });
+            }
+            if let Some(delta) =
+                node.trace.step_deltas.last_mut().filter(|delta| delta.step == step_idx)
+            {
+                delta.gas_remaining_after = gas_remaining_after;
+                delta.record_memory_write(
+                    &interp.memory.borrow().context_memory(),
+                    &mut self.budget,
+                );
+            }
+        }
     }
 }
 
@@ -902,20 +1016,30 @@ impl<CTX> Inspector<CTX> for TracingInspector
 where
     CTX: ContextTr<Journal: JournalExt>,
 {
-    fn initialize_interp(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+    fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         if self.spec_id.is_none() {
             self.spec_id = Some(interp.runtime_flag.spec_id());
         }
         if let Some(trace) = self.trace_stack.last().copied() {
             self.traces.arena[trace].trace.entered_evm = true;
         }
+        if self.config.record_bytecode {
+            self.last_trace().trace.bytecode = Some(interp.bytecode.original_bytes());
+        }
+        self.budget.check_and_halt(context, interp);
     }
 
     #[inline]
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        // revm invokes this even if initialize_interp already halted.
         if self.config.record_steps {
-            self.start_step(interp, context);
+            if self.budget.exceeded() {
+                self.record_step_end = false;
+            } else {
+                self.start_step(interp, context);
+            }
         }
+        self.budget.check_and_halt(context, interp);
     }
 
     #[inline]
@@ -923,6 +1047,7 @@ where
         if self.config.record_steps {
             self.fill_step_on_step_end(interp, context);
         }
+        self.budget.check_and_halt(context, interp);
     }
 
     fn log(&mut self, _context: &mut CTX, log: Log) {
@@ -970,7 +1095,19 @@ where
             .exclude_precompile_calls
             .then(|| self.is_precompile_call(context, &to, &value));
 
-        let input = inputs.input_data(context);
+        let input = if self.config.record_inputs {
+            if matches!(inputs.input, CallInput::SharedBuffer(_)) {
+                // SharedBuffer is copied by input_data; check its size before copying.
+                let record = self.budget.reserve(inputs.input.len());
+                let input = if record { inputs.input_data(context) } else { Bytes::new() };
+                self.budget.check(context);
+                input
+            } else {
+                inputs.input_data(context)
+            }
+        } else {
+            Bytes::new()
+        };
         let trace = self.start_trace_on_call(
             context,
             to,
@@ -1004,7 +1141,7 @@ where
         self.start_trace_on_call(
             context,
             inputs.created_address(nonce),
-            inputs.init_code().clone(),
+            if self.config.record_inputs { inputs.init_code().clone() } else { Bytes::new() },
             inputs.value(),
             inputs.scheme().into(),
             inputs.caller(),
@@ -1117,6 +1254,37 @@ impl CallInputExt for CallInputs {
                 .unwrap_or_default(),
             CallInput::Bytes(bytes) => bytes.clone(),
         }
+    }
+}
+
+/// Returns the memory range the opcode writes, derived from its inputs on the stack.
+///
+/// Only writes are tracked: instructions that merely expand memory, like `MLOAD`, yield `None`.
+fn memory_write_range(op: u8, stack: &[U256]) -> Option<Range<usize>> {
+    let back = |index: usize| {
+        stack.get(stack.len().checked_sub(index + 1)?).and_then(|v| usize::try_from(*v).ok())
+    };
+    let (offset, size) = match op {
+        opcode::MSTORE => (back(0)?, 32),
+        opcode::MSTORE8 => (back(0)?, 1),
+        opcode::CALLDATACOPY | opcode::CODECOPY | opcode::RETURNDATACOPY | opcode::MCOPY => {
+            (back(0)?, back(2)?)
+        }
+        opcode::EXTCODECOPY => (back(1)?, back(3)?),
+        opcode::CALL | opcode::CALLCODE => (back(5)?, back(6)?),
+        opcode::DELEGATECALL | opcode::STATICCALL => (back(4)?, back(5)?),
+        _ => return None,
+    };
+    (size != 0).then_some(offset..offset.checked_add(size)?)
+}
+
+/// Returns the storage write of an `SSTORE`, derived from its inputs on the stack.
+///
+/// This is independent of the journal, which has no entry for a warm write of the unchanged value.
+fn storage_write(op: u8, stack: &[U256]) -> Option<StorageDelta> {
+    match (op, stack) {
+        (opcode::SSTORE, [.., val, key]) => Some(StorageDelta { key: *key, val: *val }),
+        _ => None,
     }
 }
 
